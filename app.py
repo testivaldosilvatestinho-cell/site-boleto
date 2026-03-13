@@ -1,0 +1,869 @@
+"""
+================================================================================
+  CONCILIAÇÃO BANCÁRIA — Interface Streamlit
+  Upload drag-and-drop → Prévia → Processamento → Gráficos → Download Excel
+================================================================================
+  Instalação:
+      pip install streamlit pandas openpyxl plotly chardet xlsxwriter
+  Execução:
+      streamlit run conciliacao_app.py
+================================================================================
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import plotly.express as px
+from decimal import Decimal, ROUND_HALF_UP, getcontext
+from io import BytesIO
+import re
+
+getcontext().prec = 12
+
+# ==============================================================================
+# CONFIGURAÇÃO DA PÁGINA
+# ==============================================================================
+
+st.set_page_config(
+    page_title="Conciliação Bancária",
+    page_icon="🏦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# CSS customizado
+st.markdown("""
+<style>
+    /* Header */
+    .main-header {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+        padding: 2rem 2.5rem;
+        border-radius: 16px;
+        margin-bottom: 1.5rem;
+        color: white;
+    }
+    .main-header h1 {
+        margin: 0 0 0.3rem;
+        font-size: 1.8rem;
+        font-weight: 700;
+    }
+    .main-header p {
+        margin: 0;
+        opacity: 0.75;
+        font-size: 0.95rem;
+    }
+
+    /* Metric cards */
+    .metric-row {
+        display: flex;
+        gap: 1rem;
+        margin: 1rem 0;
+    }
+    .metric-card {
+        flex: 1;
+        padding: 1.2rem 1.5rem;
+        border-radius: 12px;
+        border: 1px solid #e2e8f0;
+        background: white;
+    }
+    .metric-card .label {
+        font-size: 0.78rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        opacity: 0.6;
+        margin-bottom: 0.3rem;
+    }
+    .metric-card .value {
+        font-size: 1.5rem;
+        font-weight: 700;
+    }
+    .metric-card .sub {
+        font-size: 0.75rem;
+        opacity: 0.5;
+        margin-top: 0.2rem;
+    }
+
+    /* Status badge */
+    .badge {
+        display: inline-block;
+        padding: 0.25rem 0.75rem;
+        border-radius: 20px;
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .badge-green  { background: #dcfce7; color: #166534; }
+    .badge-yellow { background: #fef9c3; color: #854d0e; }
+    .badge-red    { background: #fee2e2; color: #991b1b; }
+    .badge-blue   { background: #dbeafe; color: #1e40af; }
+
+    /* Upload area */
+    [data-testid="stFileUploader"] {
+        border: 2px dashed #cbd5e1;
+        border-radius: 12px;
+        padding: 0.5rem;
+        transition: border-color 0.2s;
+    }
+    [data-testid="stFileUploader"]:hover {
+        border-color: #3b82f6;
+    }
+
+    /* Hide default header/footer */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0.5rem;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 0.5rem 1.5rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ==============================================================================
+# CONSTANTES E CONFIG
+# ==============================================================================
+
+CONFIG = {
+    "tolerancia_dias": 3,
+    "formatos_data": [
+        "%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y",
+        "%d/%m/%y", "%Y/%m/%d", "%d.%m.%Y",
+    ],
+}
+
+COLUMN_MAP = {
+    "data":      ["data", "date", "dt", "data_lancamento", "data_mov", "dt_mov", "data_movimentacao"],
+    "descricao": ["descricao", "historico", "descrição", "histórico", "desc", "description", "memo", "obs"],
+    "valor":     ["valor", "value", "vlr", "amount", "montante", "vl_lancamento", "valor_lancamento"],
+    "id_doc":    ["id", "documento", "doc", "id_documento", "num_doc", "numero", "nsu", "id_doc", "ref"],
+}
+
+
+# ==============================================================================
+# FUNÇÕES DE NORMALIZAÇÃO
+# ==============================================================================
+
+def limpar_valor(valor_str) -> float:
+    if pd.isna(valor_str) or str(valor_str).strip() == "":
+        return 0.0
+    s = str(valor_str).strip()
+    negativo = False
+    if s.startswith("(") and s.endswith(")"):
+        negativo = True
+        s = s[1:-1]
+    if s.upper().endswith("D") or s.upper().endswith(" D"):
+        negativo = True
+        s = re.sub(r"\s*[dD]$", "", s)
+    if s.startswith("-"):
+        negativo = True
+        s = s[1:]
+    s = re.sub(r"[R$€£\s]", "", s)
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        val = float(s)
+        return -val if negativo else val
+    except ValueError:
+        return 0.0
+
+
+def parsear_data(data_str) -> pd.Timestamp:
+    if pd.isna(data_str) or str(data_str).strip() == "":
+        return pd.NaT
+    s = str(data_str).strip()
+    for fmt in CONFIG["formatos_data"]:
+        try:
+            return pd.to_datetime(s, format=fmt)
+        except (ValueError, TypeError):
+            continue
+    try:
+        return pd.to_datetime(s, dayfirst=True)
+    except Exception:
+        return pd.NaT
+
+
+def mapear_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [
+        re.sub(r"\s+", "_", col.strip().lower()
+               .replace("á", "a").replace("ã", "a").replace("â", "a")
+               .replace("é", "e").replace("ê", "e")
+               .replace("í", "i").replace("ó", "o").replace("ô", "o")
+               .replace("ú", "u").replace("ç", "c"))
+        for col in df.columns
+    ]
+    mapeamento = {}
+    ausentes = []
+    for campo_padrao, sinonimos in COLUMN_MAP.items():
+        encontrado = False
+        for col in df.columns:
+            if col in sinonimos or any(s in col for s in sinonimos):
+                mapeamento[col] = campo_padrao
+                encontrado = True
+                break
+        if not encontrado:
+            ausentes.append(campo_padrao)
+    if ausentes:
+        raise ValueError(
+            f"Colunas obrigatórias ausentes: {ausentes}\n"
+            f"Colunas encontradas: {list(df.columns)}"
+        )
+    return df.rename(columns=mapeamento)
+
+
+def normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.dropna(how="all").reset_index(drop=True)
+    df["valor"] = df["valor"].apply(limpar_valor)
+    df = df[df["valor"] != 0.0].reset_index(drop=True)
+    df["data"] = df["data"].apply(parsear_data)
+    df = df.dropna(subset=["data"]).reset_index(drop=True)
+    df["id_doc"] = df["id_doc"].fillna("").astype(str).str.strip().str.upper()
+    df["descricao"] = df["descricao"].fillna("").astype(str).str.strip()
+    df["tipo"] = np.where(df["valor"] >= 0, "CRÉDITO", "DÉBITO")
+    return df
+
+
+def ler_upload(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        encodings = ["utf-8", "latin-1", "cp1252", "iso-8859-1"]
+        seps = [";", ",", "\t", "|"]
+        for enc in encodings:
+            for sep in seps:
+                try:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, sep=sep, encoding=enc, dtype=str)
+                    if len(df.columns) >= 3:
+                        return df
+                except Exception:
+                    continue
+        raise ValueError("Não foi possível ler o CSV. Verifique o formato.")
+    elif name.endswith((".xlsx", ".xls")):
+        engine = "openpyxl" if name.endswith(".xlsx") else "xlrd"
+        return pd.read_excel(uploaded_file, engine=engine, dtype=str)
+    else:
+        raise ValueError(f"Formato não suportado: {name}. Use .csv ou .xlsx")
+
+
+# ==============================================================================
+# MOTOR DE CONCILIAÇÃO
+# ==============================================================================
+
+def match_perfeito(extrato, controle):
+    extrato, controle = extrato.copy(), controle.copy()
+    extrato["_chave"] = (
+        extrato["data"].dt.strftime("%Y%m%d") + "|" +
+        extrato["valor"].round(2).astype(str) + "|" +
+        extrato["id_doc"]
+    )
+    controle["_chave"] = (
+        controle["data"].dt.strftime("%Y%m%d") + "|" +
+        controle["valor"].round(2).astype(str) + "|" +
+        controle["id_doc"]
+    )
+    conciliados = []
+    ext_usado, ctrl_usado = set(), set()
+    ctrl_por_chave = {}
+    for idx, row in controle.iterrows():
+        ctrl_por_chave.setdefault(row["_chave"], []).append(idx)
+
+    for idx_e, row_e in extrato.iterrows():
+        if idx_e in ext_usado:
+            continue
+        chave = row_e["_chave"]
+        if chave in ctrl_por_chave:
+            cands = [i for i in ctrl_por_chave[chave] if i not in ctrl_usado]
+            if cands:
+                idx_c = cands[0]
+                conciliados.append({
+                    "data_extrato": row_e["data"],
+                    "descricao_extrato": row_e["descricao"],
+                    "valor_extrato": row_e["valor"],
+                    "id_extrato": row_e["id_doc"],
+                    "data_controle": controle.loc[idx_c, "data"],
+                    "descricao_controle": controle.loc[idx_c, "descricao"],
+                    "valor_controle": controle.loc[idx_c, "valor"],
+                    "id_controle": controle.loc[idx_c, "id_doc"],
+                    "tipo_match": "PERFEITO",
+                    "confianca": 100,
+                    "diff_dias": 0,
+                })
+                ext_usado.add(idx_e)
+                ctrl_usado.add(idx_c)
+
+    ext_rest = extrato[~extrato.index.isin(ext_usado)].drop(columns=["_chave"])
+    ctrl_rest = controle[~controle.index.isin(ctrl_usado)].drop(columns=["_chave"])
+    return pd.DataFrame(conciliados), ext_rest, ctrl_rest
+
+
+def match_aproximado(extrato, controle):
+    tol = CONFIG["tolerancia_dias"]
+    conciliados = []
+    ext_usado, ctrl_usado = set(), set()
+    ctrl_por_valor = {}
+    for idx, row in controle.iterrows():
+        ctrl_por_valor.setdefault(round(row["valor"], 2), []).append(idx)
+
+    for idx_e, row_e in extrato.iterrows():
+        if idx_e in ext_usado:
+            continue
+        vk = round(row_e["valor"], 2)
+        if vk not in ctrl_por_valor:
+            continue
+        cands = []
+        for idx_c in ctrl_por_valor[vk]:
+            if idx_c in ctrl_usado:
+                continue
+            dd = abs((row_e["data"] - controle.loc[idx_c, "data"]).days)
+            if 0 < dd <= tol:
+                cands.append((idx_c, dd))
+        if cands:
+            cands.sort(key=lambda x: x[1])
+            idx_c, dd = cands[0]
+            conf = max(50, 100 - dd * 15)
+            conciliados.append({
+                "data_extrato": row_e["data"],
+                "descricao_extrato": row_e["descricao"],
+                "valor_extrato": row_e["valor"],
+                "id_extrato": row_e["id_doc"],
+                "data_controle": controle.loc[idx_c, "data"],
+                "descricao_controle": controle.loc[idx_c, "descricao"],
+                "valor_controle": controle.loc[idx_c, "valor"],
+                "id_controle": controle.loc[idx_c, "id_doc"],
+                "tipo_match": "APROXIMADO",
+                "confianca": conf,
+                "diff_dias": dd,
+            })
+            ext_usado.add(idx_e)
+            ctrl_usado.add(idx_c)
+
+    ext_rest = extrato[~extrato.index.isin(ext_usado)]
+    ctrl_rest = controle[~controle.index.isin(ctrl_usado)]
+    return pd.DataFrame(conciliados), ext_rest, ctrl_rest
+
+
+def executar_conciliacao(extrato, controle):
+    c1, er1, cr1 = match_perfeito(extrato, controle)
+    c2, er2, cr2 = match_aproximado(er1, cr1)
+
+    if len(c1) > 0 and len(c2) > 0:
+        conc = pd.concat([c1, c2], ignore_index=True)
+    elif len(c1) > 0:
+        conc = c1
+    elif len(c2) > 0:
+        conc = c2
+    else:
+        conc = pd.DataFrame()
+
+    return {
+        "conciliados": conc,
+        "pend_extrato": er2,
+        "pend_controle": cr2,
+        "stats": {
+            "total_extrato": len(extrato),
+            "total_controle": len(controle),
+            "match_perfeito": len(c1),
+            "match_aproximado": len(c2),
+            "pend_extrato": len(er2),
+            "pend_controle": len(cr2),
+        },
+    }
+
+
+# ==============================================================================
+# CÁLCULO FINANCEIRO
+# ==============================================================================
+
+def soma_decimal(series):
+    total = Decimal("0.00")
+    for v in series:
+        total += Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(total)
+
+
+def calcular_resumo(res):
+    conc = res["conciliados"]
+    r = {"cred": 0.0, "deb": 0.0, "saldo": 0.0, "pend_ext": 0.0, "pend_ctrl": 0.0}
+    if len(conc) > 0:
+        cr = conc[conc["valor_extrato"] > 0]["valor_extrato"]
+        db = conc[conc["valor_extrato"] < 0]["valor_extrato"]
+        r["cred"] = soma_decimal(cr) if len(cr) else 0.0
+        r["deb"] = soma_decimal(db) if len(db) else 0.0
+        r["saldo"] = round(r["cred"] + r["deb"], 2)
+    if len(res["pend_extrato"]) > 0:
+        r["pend_ext"] = soma_decimal(res["pend_extrato"]["valor"])
+    if len(res["pend_controle"]) > 0:
+        r["pend_ctrl"] = soma_decimal(res["pend_controle"]["valor"])
+    return r
+
+
+def formatar_brl(v):
+    sinal = "-" if v < 0 else ""
+    return f"{sinal}R$ {abs(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+# ==============================================================================
+# GERAÇÃO DO EXCEL PARA DOWNLOAD
+# ==============================================================================
+
+def gerar_excel(res, resumo) -> bytes:
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        # Aba Conciliados
+        conc = res["conciliados"]
+        if len(conc) > 0:
+            dc = conc.copy()
+            dc["data_extrato"] = pd.to_datetime(dc["data_extrato"]).dt.strftime("%d/%m/%Y")
+            dc["data_controle"] = pd.to_datetime(dc["data_controle"]).dt.strftime("%d/%m/%Y")
+            dc["confianca"] = dc["confianca"].astype(str) + "%"
+            dc.columns = [
+                "Data Extrato", "Desc. Extrato", "Valor Extrato", "ID Extrato",
+                "Data Controle", "Desc. Controle", "Valor Controle", "ID Controle",
+                "Tipo Match", "Confiança", "Diff Dias",
+            ]
+            dc.to_excel(w, sheet_name="Conciliados", index=False)
+        else:
+            pd.DataFrame({"Info": ["Nenhum item conciliado"]}).to_excel(
+                w, sheet_name="Conciliados", index=False
+            )
+
+        # Aba Pendências Banco
+        pe = res["pend_extrato"]
+        if len(pe) > 0:
+            dp = pe[["data", "descricao", "valor", "id_doc", "tipo"]].copy()
+            dp["data"] = pd.to_datetime(dp["data"]).dt.strftime("%d/%m/%Y")
+            dp.columns = ["Data", "Descrição", "Valor", "ID/Doc", "Tipo"]
+            dp.to_excel(w, sheet_name="Pendências Banco", index=False)
+        else:
+            pd.DataFrame({"Info": ["Sem pendências"]}).to_excel(
+                w, sheet_name="Pendências Banco", index=False
+            )
+
+        # Aba Pendências Controle
+        pc = res["pend_controle"]
+        if len(pc) > 0:
+            dp2 = pc[["data", "descricao", "valor", "id_doc", "tipo"]].copy()
+            dp2["data"] = pd.to_datetime(dp2["data"]).dt.strftime("%d/%m/%Y")
+            dp2.columns = ["Data", "Descrição", "Valor", "ID/Doc", "Tipo"]
+            dp2.to_excel(w, sheet_name="Pendências Controle", index=False)
+        else:
+            pd.DataFrame({"Info": ["Sem pendências"]}).to_excel(
+                w, sheet_name="Pendências Controle", index=False
+            )
+
+        # Aba Resumo
+        s = res["stats"]
+        tc = s["match_perfeito"] + s["match_aproximado"]
+        tt = max(s["total_extrato"], s["total_controle"])
+        rows = [
+            ["ESTATÍSTICAS", ""],
+            ["Lançamentos no Extrato", s["total_extrato"]],
+            ["Lançamentos no Controle", s["total_controle"]],
+            ["Matches Perfeitos", s["match_perfeito"]],
+            ["Matches Aproximados", s["match_aproximado"]],
+            ["Total Conciliados", tc],
+            ["Pendentes Extrato", s["pend_extrato"]],
+            ["Pendentes Controle", s["pend_controle"]],
+            ["Taxa de Conciliação", f"{(tc / tt * 100) if tt else 0:.1f}%"],
+            ["", ""],
+            ["FINANCEIRO", ""],
+            ["Créditos Conciliados", formatar_brl(resumo["cred"])],
+            ["Débitos Conciliados", formatar_brl(resumo["deb"])],
+            ["Saldo Conciliado", formatar_brl(resumo["saldo"])],
+            ["Pendências Extrato", formatar_brl(resumo["pend_ext"])],
+            ["Pendências Controle", formatar_brl(resumo["pend_ctrl"])],
+        ]
+        pd.DataFrame(rows, columns=["Métrica", "Valor"]).to_excel(
+            w, sheet_name="Resumo", index=False
+        )
+
+        # Auto-ajuste de largura em todas as abas
+        for sn in w.sheets:
+            ws = w.sheets[sn]
+            ws.set_column("A:K", 20)
+
+    return buf.getvalue()
+
+
+# ==============================================================================
+# GRÁFICOS PLOTLY
+# ==============================================================================
+
+def grafico_distribuicao(stats):
+    labels = ["Match Perfeito", "Match Aproximado", "Pend. Extrato", "Pend. Controle"]
+    values = [stats["match_perfeito"], stats["match_aproximado"], stats["pend_extrato"], stats["pend_controle"]]
+    colors = ["#10b981", "#3b82f6", "#f59e0b", "#ef4444"]
+
+    fig = go.Figure(go.Pie(
+        labels=labels,
+        values=values,
+        hole=0.55,
+        marker=dict(colors=colors, line=dict(color="white", width=2)),
+        textinfo="label+percent",
+        textfont=dict(size=12),
+        hovertemplate="<b>%{label}</b><br>%{value} itens<br>%{percent}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text="Distribuição dos Resultados", font=dict(size=16)),
+        height=380,
+        margin=dict(t=60, b=20, l=20, r=20),
+        legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def grafico_financeiro(resumo):
+    cats = ["Créditos\nConciliados", "Débitos\nConciliados", "Pend.\nExtrato", "Pend.\nControle"]
+    vals = [resumo["cred"], abs(resumo["deb"]), resumo["pend_ext"], abs(resumo["pend_ctrl"])]
+    colors = ["#10b981", "#ef4444", "#f59e0b", "#8b5cf6"]
+
+    fig = go.Figure(go.Bar(
+        x=cats, y=vals,
+        marker=dict(color=colors, cornerradius=6),
+        text=[formatar_brl(v) for v in [resumo["cred"], resumo["deb"], resumo["pend_ext"], resumo["pend_ctrl"]]],
+        textposition="outside",
+        textfont=dict(size=11),
+        hovertemplate="<b>%{x}</b><br>%{text}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text="Resumo Financeiro", font=dict(size=16)),
+        height=380,
+        margin=dict(t=60, b=60, l=60, r=20),
+        yaxis=dict(title="Valor (R$)", gridcolor="#f1f5f9"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+    return fig
+
+
+def grafico_timeline(conciliados):
+    if len(conciliados) == 0:
+        return None
+    df = conciliados.copy()
+    df["data_extrato"] = pd.to_datetime(df["data_extrato"])
+    daily = df.groupby(df["data_extrato"].dt.date).agg(
+        qtd=("valor_extrato", "count"),
+        total=("valor_extrato", "sum"),
+    ).reset_index()
+    daily.columns = ["data", "qtd", "total"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=daily["data"], y=daily["qtd"],
+        mode="lines+markers",
+        name="Qtd. Conciliados",
+        line=dict(color="#3b82f6", width=2),
+        marker=dict(size=6),
+        hovertemplate="<b>%{x}</b><br>%{y} itens<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text="Conciliações por Dia", font=dict(size=16)),
+        height=320,
+        margin=dict(t=60, b=40, l=60, r=20),
+        xaxis=dict(title="Data"),
+        yaxis=dict(title="Quantidade", gridcolor="#f1f5f9"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def grafico_confianca(conciliados):
+    if len(conciliados) == 0:
+        return None
+    df = conciliados.copy()
+    bins = [0, 59, 79, 99, 100]
+    labels_b = ["50-59%", "60-79%", "80-99%", "100%"]
+    df["faixa"] = pd.cut(df["confianca"], bins=bins, labels=labels_b, include_lowest=True)
+    counts = df["faixa"].value_counts().reindex(labels_b, fill_value=0)
+    colors_b = ["#ef4444", "#f59e0b", "#3b82f6", "#10b981"]
+
+    fig = go.Figure(go.Bar(
+        x=counts.index, y=counts.values,
+        marker=dict(color=colors_b, cornerradius=6),
+        text=counts.values, textposition="outside",
+        hovertemplate="<b>%{x}</b><br>%{y} itens<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text="Distribuição de Confiança", font=dict(size=16)),
+        height=320,
+        margin=dict(t=60, b=40, l=60, r=20),
+        yaxis=dict(title="Quantidade", gridcolor="#f1f5f9"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+# ==============================================================================
+# APP PRINCIPAL
+# ==============================================================================
+
+def main():
+
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>🏦 Conciliação Bancária</h1>
+        <p>Extrato Bancário × Controle Interno — Upload, processe e baixe o relatório</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Sidebar config ──
+    with st.sidebar:
+        st.markdown("### ⚙️ Configurações")
+        tol = st.slider(
+            "Tolerância de dias (Match Aproximado)",
+            min_value=1, max_value=10, value=3,
+            help="Janela em dias para considerar datas como 'próximas' no match aproximado.",
+        )
+        CONFIG["tolerancia_dias"] = tol
+
+        st.markdown("---")
+        st.markdown("### 📋 Colunas Obrigatórias")
+        st.markdown("""
+        Ambos os arquivos devem conter:
+        - **Data** (data, dt, data_mov...)
+        - **Descrição** (descricao, historico...)
+        - **Valor** (valor, value, amount...)
+        - **ID/Documento** (id, doc, nsu...)
+        """)
+
+        st.markdown("---")
+        st.markdown("### 📖 Como funciona")
+        st.markdown("""
+        1. **Upload** dos dois arquivos
+        2. **Prévia** dos dados carregados
+        3. **Processar** a conciliação
+        4. **Analisar** gráficos e tabelas
+        5. **Download** do Excel final
+        """)
+
+    # ── Upload Section ──
+    st.markdown("## 📁 Upload dos Arquivos")
+    col_up1, col_up2 = st.columns(2)
+
+    with col_up1:
+        st.markdown("#### Extrato Bancário")
+        file_extrato = st.file_uploader(
+            "Arraste ou clique para enviar",
+            type=["csv", "xlsx", "xls"],
+            key="extrato",
+            help="Arquivo do banco (.csv ou .xlsx)",
+        )
+
+    with col_up2:
+        st.markdown("#### Controle Interno / ERP")
+        file_controle = st.file_uploader(
+            "Arraste ou clique para enviar",
+            type=["csv", "xlsx", "xls"],
+            key="controle",
+            help="Arquivo do seu sistema (.csv ou .xlsx)",
+        )
+
+    # ── Prévia ──
+    if file_extrato and file_controle:
+        try:
+            raw_ext = ler_upload(file_extrato)
+            raw_ctrl = ler_upload(file_controle)
+        except Exception as e:
+            st.error(f"Erro ao ler arquivos: {e}")
+            return
+
+        st.markdown("---")
+        st.markdown("## 👁️ Prévia dos Dados Brutos")
+
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            st.markdown(f"**Extrato** — {len(raw_ext)} linhas, {len(raw_ext.columns)} colunas")
+            st.dataframe(raw_ext.head(8), use_container_width=True, height=300)
+        with col_p2:
+            st.markdown(f"**Controle** — {len(raw_ctrl)} linhas, {len(raw_ctrl.columns)} colunas")
+            st.dataframe(raw_ctrl.head(8), use_container_width=True, height=300)
+
+        # ── Botão Processar ──
+        st.markdown("---")
+        col_btn = st.columns([1, 2, 1])
+        with col_btn[1]:
+            processar = st.button(
+                "⚡ Processar Conciliação",
+                use_container_width=True,
+                type="primary",
+            )
+
+        if processar:
+            with st.spinner("Normalizando dados..."):
+                try:
+                    df_ext = mapear_colunas(raw_ext.copy())
+                    df_ext = normalizar_df(df_ext)
+                    df_ctrl = mapear_colunas(raw_ctrl.copy())
+                    df_ctrl = normalizar_df(df_ctrl)
+                except Exception as e:
+                    st.error(f"Erro na normalização: {e}")
+                    return
+
+            with st.spinner("Executando conciliação..."):
+                resultado = executar_conciliacao(df_ext, df_ctrl)
+                resumo = calcular_resumo(resultado)
+
+            st.session_state["resultado"] = resultado
+            st.session_state["resumo"] = resumo
+
+        # ── Resultados ──
+        if "resultado" in st.session_state:
+            resultado = st.session_state["resultado"]
+            resumo = st.session_state["resumo"]
+            stats = resultado["stats"]
+            tc = stats["match_perfeito"] + stats["match_aproximado"]
+            tt = max(stats["total_extrato"], stats["total_controle"])
+            pct = (tc / tt * 100) if tt else 0
+
+            st.markdown("---")
+            st.markdown("## 📊 Resultados da Conciliação")
+
+            # Métricas
+            st.markdown(f"""
+            <div class="metric-row">
+                <div class="metric-card">
+                    <div class="label">Taxa de Conciliação</div>
+                    <div class="value" style="color: {'#10b981' if pct >= 80 else '#f59e0b' if pct >= 50 else '#ef4444'}">{pct:.1f}%</div>
+                    <div class="sub">{tc} de {tt} itens conciliados</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Match Perfeito</div>
+                    <div class="value" style="color: #10b981">{stats['match_perfeito']}</div>
+                    <div class="sub"><span class="badge badge-green">Data + Valor + ID</span></div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Match Aproximado</div>
+                    <div class="value" style="color: #3b82f6">{stats['match_aproximado']}</div>
+                    <div class="sub"><span class="badge badge-blue">Valor + Data ±{CONFIG['tolerancia_dias']}d</span></div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Pendências</div>
+                    <div class="value" style="color: #ef4444">{stats['pend_extrato'] + stats['pend_controle']}</div>
+                    <div class="sub">{stats['pend_extrato']} banco · {stats['pend_controle']} controle</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Financeiro
+            st.markdown(f"""
+            <div class="metric-row">
+                <div class="metric-card">
+                    <div class="label">Créditos Conciliados</div>
+                    <div class="value" style="color: #10b981">{formatar_brl(resumo['cred'])}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Débitos Conciliados</div>
+                    <div class="value" style="color: #ef4444">{formatar_brl(resumo['deb'])}</div>
+                </div>
+                <div class="metric-card">
+                    <div class="label">Saldo Conciliado</div>
+                    <div class="value" style="color: #1a1a2e">{formatar_brl(resumo['saldo'])}</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Gráficos
+            st.markdown("### 📈 Análise Visual")
+            g_col1, g_col2 = st.columns(2)
+            with g_col1:
+                st.plotly_chart(grafico_distribuicao(stats), use_container_width=True)
+            with g_col2:
+                st.plotly_chart(grafico_financeiro(resumo), use_container_width=True)
+
+            g_col3, g_col4 = st.columns(2)
+            with g_col3:
+                fig_tl = grafico_timeline(resultado["conciliados"])
+                if fig_tl:
+                    st.plotly_chart(fig_tl, use_container_width=True)
+            with g_col4:
+                fig_cf = grafico_confianca(resultado["conciliados"])
+                if fig_cf:
+                    st.plotly_chart(fig_cf, use_container_width=True)
+
+            # Tabelas detalhadas
+            st.markdown("### 📋 Detalhamento")
+            tab1, tab2, tab3 = st.tabs([
+                f"✅ Conciliados ({tc})",
+                f"⚠️ Pendências Banco ({stats['pend_extrato']})",
+                f"⚠️ Pendências Controle ({stats['pend_controle']})",
+            ])
+
+            with tab1:
+                conc = resultado["conciliados"]
+                if len(conc) > 0:
+                    display = conc.copy()
+                    display["data_extrato"] = pd.to_datetime(display["data_extrato"]).dt.strftime("%d/%m/%Y")
+                    display["data_controle"] = pd.to_datetime(display["data_controle"]).dt.strftime("%d/%m/%Y")
+                    display["valor_extrato"] = display["valor_extrato"].apply(formatar_brl)
+                    display["valor_controle"] = display["valor_controle"].apply(formatar_brl)
+                    display["confianca"] = display["confianca"].astype(str) + "%"
+                    display.columns = [
+                        "Data Ext.", "Desc. Ext.", "Valor Ext.", "ID Ext.",
+                        "Data Ctrl.", "Desc. Ctrl.", "Valor Ctrl.", "ID Ctrl.",
+                        "Match", "Conf.", "Δ Dias",
+                    ]
+                    st.dataframe(display, use_container_width=True, height=400)
+                else:
+                    st.info("Nenhum item conciliado.")
+
+            with tab2:
+                pe = resultado["pend_extrato"]
+                if len(pe) > 0:
+                    dp = pe[["data", "descricao", "valor", "id_doc", "tipo"]].copy()
+                    dp["data"] = pd.to_datetime(dp["data"]).dt.strftime("%d/%m/%Y")
+                    dp["valor"] = dp["valor"].apply(formatar_brl)
+                    dp.columns = ["Data", "Descrição", "Valor", "ID/Doc", "Tipo"]
+                    st.dataframe(dp, use_container_width=True, height=400)
+                else:
+                    st.success("Nenhuma pendência no extrato bancário.")
+
+            with tab3:
+                pc = resultado["pend_controle"]
+                if len(pc) > 0:
+                    dp2 = pc[["data", "descricao", "valor", "id_doc", "tipo"]].copy()
+                    dp2["data"] = pd.to_datetime(dp2["data"]).dt.strftime("%d/%m/%Y")
+                    dp2["valor"] = dp2["valor"].apply(formatar_brl)
+                    dp2.columns = ["Data", "Descrição", "Valor", "ID/Doc", "Tipo"]
+                    st.dataframe(dp2, use_container_width=True, height=400)
+                else:
+                    st.success("Nenhuma pendência no controle interno.")
+
+            # Download
+            st.markdown("---")
+            st.markdown("## 📥 Download do Relatório")
+            excel_bytes = gerar_excel(resultado, resumo)
+
+            col_dl = st.columns([1, 2, 1])
+            with col_dl[1]:
+                st.download_button(
+                    label="⬇️  Baixar resultado_conciliacao.xlsx",
+                    data=excel_bytes,
+                    file_name="resultado_conciliacao.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    type="primary",
+                )
+                st.caption("Arquivo Excel com 4 abas: Conciliados, Pendências Banco, Pendências Controle e Resumo.")
+
+    elif file_extrato or file_controle:
+        st.info("📎 Envie ambos os arquivos para continuar.")
+
+
+if __name__ == "__main__":
+    main()
