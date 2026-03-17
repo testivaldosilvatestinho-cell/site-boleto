@@ -18,6 +18,7 @@ import plotly.express as px
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 from io import BytesIO
 import re
+from difflib import SequenceMatcher
 
 getcontext().prec = 12
 
@@ -514,6 +515,77 @@ def executar_conciliacao(extrato, controle):
     }
 
 
+def _extrair_nome(desc):
+    """Extrai nome de pessoa/empresa da descrição do extrato."""
+    desc_lower = desc.lower()
+    for prefix in [
+        "pix enviado ", "pix recebido ", "transferência pix enviada ",
+        "transferência pix recebida ", "transferencia programada ",
+        "transferência recebida ", "pagamento de conta ",
+    ]:
+        if desc_lower.startswith(prefix):
+            return desc_lower[len(prefix):].strip()
+    return desc_lower.strip()
+
+
+def encontrar_matches_parciais(pend_ext, pend_ctrl, limite=30):
+    """Encontra pares com nome parecido entre pendências do extrato e controle."""
+    matches = []
+    for _, re_ in pend_ext.iterrows():
+        if re_["valor"] >= 0:
+            continue
+        nome_ext = _extrair_nome(re_["descricao"])
+        for _, rc in pend_ctrl.iterrows():
+            nome_ctrl = rc["descricao"].lower().strip()
+            sim = SequenceMatcher(None, nome_ext, nome_ctrl).ratio()
+            if sim > 0.55:
+                matches.append({
+                    "desc_ext": re_["descricao"],
+                    "valor_ext": re_["valor"],
+                    "data_ext": re_["data"],
+                    "desc_ctrl": rc["descricao"],
+                    "valor_ctrl": rc["valor"],
+                    "data_ctrl": rc["data"],
+                    "similaridade": round(sim * 100),
+                    "diff_valor": round(abs(abs(re_["valor"]) - abs(rc["valor"])), 2),
+                })
+    matches.sort(key=lambda x: (-x["similaridade"], x["diff_valor"]))
+    seen = set()
+    dedup = []
+    for m in matches:
+        key = (m["desc_ext"][:30], m["desc_ctrl"][:30], m["valor_ext"], m["valor_ctrl"])
+        if key not in seen:
+            seen.add(key)
+            dedup.append(m)
+    return dedup[:limite]
+
+
+def gerar_timeline(conciliados, pend_ext, pend_ctrl):
+    """Gera dados de timeline dia a dia."""
+    from collections import defaultdict
+    tl = defaultdict(lambda: {"conc": 0, "pe": 0, "pc": 0, "v_conc": 0.0, "v_pend": 0.0})
+
+    if len(conciliados) > 0:
+        for _, r in conciliados.iterrows():
+            d = pd.to_datetime(r["data_extrato"]).strftime("%d/%m")
+            tl[d]["conc"] += 1
+            tl[d]["v_conc"] += abs(r["valor_extrato"])
+
+    if len(pend_ext) > 0:
+        for _, r in pend_ext.iterrows():
+            d = pd.to_datetime(r["data"]).strftime("%d/%m")
+            tl[d]["pe"] += 1
+            tl[d]["v_pend"] += abs(r["valor"])
+
+    if len(pend_ctrl) > 0:
+        for _, r in pend_ctrl.iterrows():
+            d = pd.to_datetime(r["data"]).strftime("%d/%m")
+            tl[d]["pc"] += 1
+            tl[d]["v_pend"] += abs(r["valor"])
+
+    return dict(sorted(tl.items()))
+
+
 # ==============================================================================
 # CÁLCULO FINANCEIRO
 # ==============================================================================
@@ -898,55 +970,40 @@ def main():
             tc = stats["match_perfeito"] + stats["match_aproximado"]
             tt = max(stats["total_extrato"], stats["total_controle"])
             pct = (tc / tt * 100) if tt else 0
+            val_conc = soma_decimal(resultado["conciliados"]["valor_extrato"].abs()) if len(resultado["conciliados"]) > 0 else 0
+            val_pe = soma_decimal(resultado["pend_extrato"]["valor"].abs()) if len(resultado["pend_extrato"]) > 0 else 0
+            val_pc = soma_decimal(resultado["pend_controle"]["valor"].abs()) if len(resultado["pend_controle"]) > 0 else 0
 
             st.markdown("---")
             st.markdown("## 📊 Resultados da Conciliação")
 
-            # Métricas
+            # --- Métricas ---
             st.markdown(f"""
             <div class="metric-row">
                 <div class="metric-card">
                     <div class="label">Taxa de Conciliação</div>
                     <div class="value" style="color: {'#10b981' if pct >= 80 else '#f59e0b' if pct >= 50 else '#ef4444'}">{pct:.1f}%</div>
-                    <div class="sub">{tc} de {tt} itens conciliados</div>
+                    <div class="sub">{tc} de {tt} itens</div>
                 </div>
                 <div class="metric-card">
-                    <div class="label">Match Perfeito</div>
-                    <div class="value" style="color: #10b981">{stats['match_perfeito']}</div>
-                    <div class="sub"><span class="badge badge-green">Data + Valor + ID</span></div>
+                    <div class="label">Conciliados</div>
+                    <div class="value" style="color: #10b981">{tc}</div>
+                    <div class="sub">{formatar_brl(val_conc)}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="label">Match Aproximado</div>
-                    <div class="value" style="color: #3b82f6">{stats['match_aproximado']}</div>
-                    <div class="sub"><span class="badge badge-blue">Valor + Data ±{CONFIG['tolerancia_dias']}d</span></div>
+                    <div class="label">Pend. Extrato</div>
+                    <div class="value" style="color: #f59e0b">{stats['pend_extrato']}</div>
+                    <div class="sub">{formatar_brl(val_pe)}</div>
                 </div>
                 <div class="metric-card">
-                    <div class="label">Pendências</div>
-                    <div class="value" style="color: #ef4444">{stats['pend_extrato'] + stats['pend_controle']}</div>
-                    <div class="sub">{stats['pend_extrato']} banco · {stats['pend_controle']} controle</div>
+                    <div class="label">Pend. Controle</div>
+                    <div class="value" style="color: #ef4444">{stats['pend_controle']}</div>
+                    <div class="sub">{formatar_brl(val_pc)}</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
 
-            # Financeiro
-            st.markdown(f"""
-            <div class="metric-row">
-                <div class="metric-card">
-                    <div class="label">Créditos Conciliados</div>
-                    <div class="value" style="color: #10b981">{formatar_brl(resumo['cred'])}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="label">Débitos Conciliados</div>
-                    <div class="value" style="color: #ef4444">{formatar_brl(resumo['deb'])}</div>
-                </div>
-                <div class="metric-card">
-                    <div class="label">Saldo Conciliado</div>
-                    <div class="value" style="color: #1a1a2e">{formatar_brl(resumo['saldo'])}</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            # Gráficos
+            # --- Gráficos ---
             st.markdown("### 📈 Análise Visual")
             g_col1, g_col2 = st.columns(2)
             with g_col1:
@@ -954,22 +1011,76 @@ def main():
             with g_col2:
                 st.plotly_chart(grafico_financeiro(resumo), use_container_width=True)
 
-            g_col3, g_col4 = st.columns(2)
-            with g_col3:
-                fig_tl = grafico_timeline(resultado["conciliados"])
-                if fig_tl:
-                    st.plotly_chart(fig_tl, use_container_width=True)
-            with g_col4:
-                fig_cf = grafico_confianca(resultado["conciliados"])
-                if fig_cf:
-                    st.plotly_chart(fig_cf, use_container_width=True)
+            # --- Timeline ---
+            st.markdown("### 📅 Linha do Tempo — Dia a Dia")
+            tl_data = gerar_timeline(
+                resultado["conciliados"], resultado["pend_extrato"], resultado["pend_controle"]
+            )
+            if tl_data:
+                tl_df = pd.DataFrame([
+                    {"Data": k, "Conciliados": v["conc"], "Pend. Extrato": v["pe"], "Pend. Controle": v["pc"]}
+                    for k, v in tl_data.items()
+                ])
+                fig_tl = go.Figure()
+                fig_tl.add_trace(go.Bar(
+                    x=tl_df["Data"], y=tl_df["Conciliados"], name="Conciliados",
+                    marker_color="#10b981",
+                ))
+                fig_tl.add_trace(go.Bar(
+                    x=tl_df["Data"], y=tl_df["Pend. Extrato"], name="Pend. Extrato",
+                    marker_color="#f59e0b",
+                ))
+                fig_tl.add_trace(go.Bar(
+                    x=tl_df["Data"], y=tl_df["Pend. Controle"], name="Pend. Controle",
+                    marker_color="#ef4444",
+                ))
+                fig_tl.update_layout(
+                    barmode="stack", height=320,
+                    margin=dict(t=20, b=40, l=40, r=20),
+                    legend=dict(orientation="h", y=1.08, x=0.5, xanchor="center"),
+                    xaxis=dict(title="Data", tickangle=-45),
+                    yaxis=dict(title="Qtd.", gridcolor="#f1f5f9"),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                )
+                st.plotly_chart(fig_tl, use_container_width=True)
 
-            # Tabelas detalhadas
+            # --- Matches Parciais ---
+            st.markdown("### 🔍 Matches Parciais — Possíveis Correspondências")
+            st.caption("Nomes parecidos entre extrato e controle que não bateram por valor ou data. Podem ser o mesmo pagamento.")
+            parciais = encontrar_matches_parciais(resultado["pend_extrato"], resultado["pend_controle"])
+
+            if parciais:
+                df_parciais = pd.DataFrame(parciais)
+                df_parciais["data_ext"] = pd.to_datetime(df_parciais["data_ext"]).dt.strftime("%d/%m/%Y")
+                df_parciais["data_ctrl"] = pd.to_datetime(df_parciais["data_ctrl"]).dt.strftime("%d/%m/%Y")
+
+                display_p = df_parciais[[
+                    "desc_ext", "valor_ext", "data_ext",
+                    "desc_ctrl", "valor_ctrl", "data_ctrl",
+                    "similaridade", "diff_valor",
+                ]].copy()
+                display_p["valor_ext"] = display_p["valor_ext"].apply(formatar_brl)
+                display_p["valor_ctrl"] = display_p["valor_ctrl"].apply(formatar_brl)
+                display_p["diff_valor"] = display_p["diff_valor"].apply(
+                    lambda v: "✅ Valor OK" if v == 0 else formatar_brl(v)
+                )
+                display_p["similaridade"] = display_p["similaridade"].astype(str) + "%"
+                display_p.columns = [
+                    "Extrato", "Valor Ext.", "Data Ext.",
+                    "Controle", "Valor Ctrl.", "Data Ctrl.",
+                    "Similaridade", "Δ Valor",
+                ]
+                st.dataframe(display_p, use_container_width=True, height=400)
+            else:
+                st.info("Nenhum match parcial encontrado.")
+
+            # --- Tabelas detalhadas ---
             st.markdown("### 📋 Detalhamento")
-            tab1, tab2, tab3 = st.tabs([
+            tab1, tab2, tab3, tab4 = st.tabs([
                 f"✅ Conciliados ({tc})",
-                f"⚠️ Pendências Banco ({stats['pend_extrato']})",
-                f"⚠️ Pendências Controle ({stats['pend_controle']})",
+                f"⚠️ Pend. Banco ({stats['pend_extrato']})",
+                f"🔴 Pend. Controle ({stats['pend_controle']})",
+                f"📈 Confiança",
             ])
 
             with tab1:
@@ -1012,7 +1123,14 @@ def main():
                 else:
                     st.success("Nenhuma pendência no controle interno.")
 
-            # Download
+            with tab4:
+                fig_cf = grafico_confianca(resultado["conciliados"])
+                if fig_cf:
+                    st.plotly_chart(fig_cf, use_container_width=True)
+                else:
+                    st.info("Sem dados de confiança.")
+
+            # --- Download ---
             st.markdown("---")
             st.markdown("## 📥 Download do Relatório")
             excel_bytes = gerar_excel(resultado, resumo)
@@ -1027,7 +1145,7 @@ def main():
                     use_container_width=True,
                     type="primary",
                 )
-                st.caption("Arquivo Excel com 4 abas: Conciliados, Pendências Banco, Pendências Controle e Resumo.")
+                st.caption("Excel com abas: Conciliados, Pendências Banco, Pendências Controle e Resumo.")
 
     elif file_extrato or file_controle:
         st.info("📎 Envie ambos os arquivos para continuar.")
