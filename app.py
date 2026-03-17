@@ -138,10 +138,26 @@ CONFIG = {
 }
 
 COLUMN_MAP = {
-    "data":      ["data", "date", "dt", "data_lancamento", "data_mov", "dt_mov", "data_movimentacao"],
-    "descricao": ["descricao", "historico", "descrição", "histórico", "desc", "description", "memo", "obs"],
-    "valor":     ["valor", "value", "vlr", "amount", "montante", "vl_lancamento", "valor_lancamento"],
-    "id_doc":    ["id", "documento", "doc", "id_documento", "num_doc", "numero", "nsu", "id_doc", "ref"],
+    "data": [
+        "data", "date", "dt", "data_lancamento", "data_mov", "dt_mov",
+        "data_movimentacao", "release_date", "fecha",
+        "previsao_de_pagamento", "vencimento", "ultimo_pagamento",
+    ],
+    "descricao": [
+        "descricao", "historico", "descricão", "histórico", "desc",
+        "description", "memo", "obs", "lancamento", "detalhes",
+        "transaction_type", "fornecedor_(nome_fantasia)",
+    ],
+    "valor": [
+        "valor", "value", "vlr", "amount", "montante",
+        "vl_lancamento", "valor_lancamento",
+        "transaction_net_amount", "valor_da_conta", "valor_liquido",
+    ],
+    "id_doc": [
+        "id", "documento", "doc", "id_documento", "num_doc", "numero",
+        "nsu", "id_doc", "ref", "referencia", "numero_documento",
+        "reference_id", "numero_do_documento",
+    ],
 }
 
 
@@ -194,6 +210,12 @@ def parsear_data(data_str) -> pd.Timestamp:
 
 
 def mapear_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mapeia colunas do arquivo para nomes padronizados.
+    Blindado: detecta formato credits/debits, headers deslocados,
+    gera id_doc sintético e descricao fallback quando ausentes.
+    """
+    # --- Normaliza nomes (minúsculo, sem acentos, underscores) ---
     df.columns = [
         re.sub(r"\s+", "_", col.strip().lower()
                .replace("á", "a").replace("ã", "a").replace("â", "a")
@@ -202,28 +224,87 @@ def mapear_colunas(df: pd.DataFrame) -> pd.DataFrame:
                .replace("ú", "u").replace("ç", "c"))
         for col in df.columns
     ]
+
+    # --- Remove colunas totalmente vazias ou "unnamed" vazias ---
+    unnamed_vazias = [c for c in df.columns
+                      if c.startswith("unnamed") and df[c].dropna().astype(str).str.strip().replace("", pd.NA).dropna().empty]
+    df = df.drop(columns=unnamed_vazias, errors="ignore")
+    df = df.dropna(axis=1, how="all")
+
+    # --- Detecção especial: formato credits/debits (extrato bancário) ---
+    cols_set = set(df.columns)
+    tem_credits = any("credit" in c for c in cols_set)
+    tem_debits = any("debit" in c for c in cols_set)
+
+    if tem_credits and tem_debits and not any(
+        c in cols_set for c in ["valor", "value", "amount", "transaction_net_amount"]
+    ):
+        col_cr = next(c for c in df.columns if "credit" in c)
+        col_db = next(c for c in df.columns if "debit" in c)
+        df[col_cr] = df[col_cr].apply(limpar_valor)
+        df[col_db] = df[col_db].apply(limpar_valor)
+        df["valor"] = df.apply(
+            lambda r: r[col_cr] if r[col_cr] != 0 else -abs(r[col_db]), axis=1
+        )
+        df = df.drop(columns=[col_cr, col_db], errors="ignore")
+
+    # --- Remove colunas de saldo/balance (não são lançamentos) ---
+    df = df.loc[:, ~df.columns.str.contains("balance|saldo|partial")]
+
+    # --- Mapeamento padrão ---
     mapeamento = {}
-    ausentes = []
+    ja_usado = set()
     for campo_padrao, sinonimos in COLUMN_MAP.items():
-        encontrado = False
         for col in df.columns:
-            if col in sinonimos or any(s in col for s in sinonimos):
+            if col in ja_usado:
+                continue
+            if col == campo_padrao or col in sinonimos or any(s in col for s in sinonimos):
                 mapeamento[col] = campo_padrao
-                encontrado = True
+                ja_usado.add(col)
                 break
-        if not encontrado:
-            ausentes.append(campo_padrao)
+    df = df.rename(columns=mapeamento)
+
+    # --- Gera id_doc sintético se ausente ---
+    if "id_doc" not in df.columns:
+        df["id_doc"] = [f"AUTO_{i+1:06d}" for i in range(len(df))]
+
+    # --- Gera descricao a partir de colunas alternativas se ausente ---
+    if "descricao" not in df.columns:
+        for fallback_col in df.columns:
+            if any(fb in fallback_col for fb in [
+                "fornecedor", "razao_social", "nome_fantasia",
+                "observacao", "categoria", "historico",
+            ]):
+                df["descricao"] = df[fallback_col]
+                break
+        else:
+            df["descricao"] = "SEM DESCRIÇÃO"
+
+    # --- Validação final ---
+    obrigatorias = {"data", "valor"}
+    presentes = set(df.columns)
+    ausentes = obrigatorias - presentes
+
     if ausentes:
         raise ValueError(
-            f"Colunas obrigatórias ausentes: {ausentes}\n"
-            f"Colunas encontradas: {list(df.columns)}"
+            f"⚠️ Arquivo não reconhecido.\n"
+            f"Colunas faltando: {sorted(ausentes)}\n"
+            f"Colunas encontradas: {sorted(df.columns.tolist())}\n"
+            f"O arquivo deve conter pelo menos Data e Valor."
         )
-    return df.rename(columns=mapeamento)
+
+    return df
 
 
 def normalizar_df(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(how="all").reset_index(drop=True)
-    df["valor"] = df["valor"].apply(limpar_valor)
+
+    # Limpa valor (suporta strings e floats já convertidos)
+    if df["valor"].dtype == object:
+        df["valor"] = df["valor"].apply(limpar_valor)
+    else:
+        df["valor"] = pd.to_numeric(df["valor"], errors="coerce").fillna(0.0)
+
     df = df[df["valor"] != 0.0].reset_index(drop=True)
     df["data"] = df["data"].apply(parsear_data)
     df = df.dropna(subset=["data"]).reset_index(drop=True)
@@ -248,9 +329,58 @@ def ler_upload(uploaded_file) -> pd.DataFrame:
                 except Exception:
                     continue
         raise ValueError("Não foi possível ler o CSV. Verifique o formato.")
+
     elif name.endswith((".xlsx", ".xls")):
         engine = "openpyxl" if name.endswith(".xlsx") else "xlrd"
-        return pd.read_excel(uploaded_file, engine=engine, dtype=str)
+
+        # --- Leitura bruta para detectar header real ---
+        uploaded_file.seek(0)
+        df_raw = pd.read_excel(uploaded_file, engine=engine, dtype=str, header=None)
+
+        # Heurística: procura nas primeiras 10 linhas a que tem mais texto
+        # (= provável header) e não é uma linha de resumo numérico
+        melhor_row = 0
+        melhor_score = 0
+        for i in range(min(10, len(df_raw))):
+            vals = df_raw.iloc[i].dropna().astype(str).str.strip()
+            vals = vals[vals != ""]
+            if len(vals) < 3:
+                continue
+            # Score = quantidade de valores não-numéricos (texto puro)
+            score = sum(
+                1 for v in vals
+                if not v.replace(".", "").replace(",", "").replace("-", "").replace(" ", "").isdigit()
+                and not v.startswith("unnamed")
+                and len(v) > 1
+            )
+            if score > melhor_score:
+                melhor_score = score
+                melhor_row = i
+
+        # Relê com header correto
+        uploaded_file.seek(0)
+        df = pd.read_excel(
+            uploaded_file, engine=engine, dtype=str,
+            skiprows=melhor_row, header=0,
+        )
+
+        # Remove linhas totalmente vazias
+        df = df.dropna(how="all").reset_index(drop=True)
+
+        # Remove colunas "Unnamed" totalmente vazias
+        unnamed_vazias = [
+            c for c in df.columns
+            if str(c).startswith("Unnamed")
+            and df[c].dropna().astype(str).str.strip().replace("", pd.NA).dropna().empty
+        ]
+        df = df.drop(columns=unnamed_vazias, errors="ignore")
+
+        # Remove linhas que são cópia do header (texto repetido)
+        if len(df) > 0:
+            first_col = df.columns[0]
+            df = df[df[first_col] != first_col].reset_index(drop=True)
+
+        return df
     else:
         raise ValueError(f"Formato não suportado: {name}. Use .csv ou .xlsx")
 
@@ -261,14 +391,16 @@ def ler_upload(uploaded_file) -> pd.DataFrame:
 
 def match_perfeito(extrato, controle):
     extrato, controle = extrato.copy(), controle.copy()
+
+    # Chave usa valor absoluto para cruzar débitos do extrato com valores do controle
     extrato["_chave"] = (
         extrato["data"].dt.strftime("%Y%m%d") + "|" +
-        extrato["valor"].round(2).astype(str) + "|" +
+        extrato["valor"].abs().round(2).astype(str) + "|" +
         extrato["id_doc"]
     )
     controle["_chave"] = (
         controle["data"].dt.strftime("%Y%m%d") + "|" +
-        controle["valor"].round(2).astype(str) + "|" +
+        controle["valor"].abs().round(2).astype(str) + "|" +
         controle["id_doc"]
     )
     conciliados = []
@@ -310,14 +442,16 @@ def match_aproximado(extrato, controle):
     tol = CONFIG["tolerancia_dias"]
     conciliados = []
     ext_usado, ctrl_usado = set(), set()
+
+    # Indexa controle por valor absoluto para cruzar com débitos do extrato
     ctrl_por_valor = {}
     for idx, row in controle.iterrows():
-        ctrl_por_valor.setdefault(round(row["valor"], 2), []).append(idx)
+        ctrl_por_valor.setdefault(round(abs(row["valor"]), 2), []).append(idx)
 
     for idx_e, row_e in extrato.iterrows():
         if idx_e in ext_usado:
             continue
-        vk = round(row_e["valor"], 2)
+        vk = round(abs(row_e["valor"]), 2)
         if vk not in ctrl_por_valor:
             continue
         cands = []
@@ -325,12 +459,12 @@ def match_aproximado(extrato, controle):
             if idx_c in ctrl_usado:
                 continue
             dd = abs((row_e["data"] - controle.loc[idx_c, "data"]).days)
-            if 0 < dd <= tol:
+            if dd <= tol:
                 cands.append((idx_c, dd))
         if cands:
             cands.sort(key=lambda x: x[1])
             idx_c, dd = cands[0]
-            conf = max(50, 100 - dd * 15)
+            conf = max(50, 100 - dd * 15) if dd > 0 else 95
             conciliados.append({
                 "data_extrato": row_e["data"],
                 "descricao_extrato": row_e["descricao"],
@@ -710,6 +844,40 @@ def main():
                     df_ext = mapear_colunas(raw_ext.copy())
                     df_ext = normalizar_df(df_ext)
                     df_ctrl = mapear_colunas(raw_ctrl.copy())
+
+                    # --- Filtro automático por conta corrente ---
+                    col_conta = None
+                    for c in df_ctrl.columns:
+                        if "conta_corrente" in c or "conta" in c and "valor" not in c:
+                            col_conta = c
+                            break
+
+                    if col_conta and df_ctrl[col_conta].nunique() > 1:
+                        contas = df_ctrl[col_conta].dropna().unique().tolist()
+                        nome_ext = file_extrato.name.lower()
+
+                        # Tenta detectar qual conta bate com o nome do extrato
+                        conta_filtro = None
+                        for conta in contas:
+                            palavras = [p for p in conta.lower().split() if len(p) > 3]
+                            if any(p in nome_ext for p in palavras):
+                                conta_filtro = conta
+                                break
+
+                        if conta_filtro:
+                            total_antes = len(df_ctrl)
+                            df_ctrl = df_ctrl[df_ctrl[col_conta] == conta_filtro]
+                            st.info(
+                                f"🏦 Filtro automático: **{conta_filtro}** "
+                                f"({len(df_ctrl)} de {total_antes} registros)"
+                            )
+                        elif len(contas) > 1:
+                            st.warning(
+                                f"⚠️ O controle tem {len(contas)} contas correntes. "
+                                f"Não foi possível filtrar automaticamente. "
+                                f"Contas: {', '.join(str(c) for c in contas)}"
+                            )
+
                     df_ctrl = normalizar_df(df_ctrl)
                 except Exception as e:
                     st.error(f"Erro na normalização: {e}")
